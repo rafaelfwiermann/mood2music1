@@ -1,0 +1,404 @@
+import { COOKIE_NAME } from "@shared/const";
+import { getSessionCookieOptions } from "./_core/cookies";
+import { systemRouter } from "./_core/systemRouter";
+import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
+import { z } from "zod";
+import { getSpotifyAuthUrl, getUserTopTracks, getUserTopArtists, getRecommendations, createPlaylist, addTracksToPlaylist, uploadPlaylistCover } from "./spotify";
+import {
+  getSpotifyToken,
+  deleteSpotifyToken,
+  getUserPlaylists,
+  getPublicPlaylists,
+  getPlaylistById,
+  getUserSubscription,
+  getMonthlyPlaylistCount,
+  getActiveMoodTemplates,
+  createPlaylistRecord,
+  createSubscription,
+  upsertSpotifyToken,
+  getDb,
+} from "./db";
+import { users, playlists, subscriptions } from "../drizzle/schema";
+import { eq, sql } from "drizzle-orm";
+import { TRPCError } from "@trpc/server";
+import { analyzeVibe, analyzeUserHistory, generatePlaylistCover } from "./ai";
+import { refreshAccessToken } from "./spotify";
+
+export const appRouter = router({
+    // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
+  system: systemRouter,
+  auth: router({
+    me: publicProcedure.query(opts => opts.ctx.user),
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return {
+        success: true,
+      } as const;
+    }),
+  }),
+
+  // Spotify integration
+  spotify: router({
+    // Get Spotify auth URL
+    getAuthUrl: protectedProcedure.query(({ ctx }) => {
+      const state = `user_${ctx.user.id}_${Date.now()}`;
+      return { url: getSpotifyAuthUrl(state) };
+    }),
+
+    // Get Spotify connection status
+    getStatus: protectedProcedure.query(async ({ ctx }) => {
+      const token = await getSpotifyToken(ctx.user.id);
+      return {
+        connected: !!token,
+        spotifyId: token?.spotifyId || null,
+      };
+    }),
+
+    // Disconnect Spotify
+    disconnect: protectedProcedure.mutation(async ({ ctx }) => {
+      await deleteSpotifyToken(ctx.user.id);
+      return { success: true };
+    }),
+  }),
+
+  // Playlist management
+  playlists: router({
+    // Get user's playlists
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return getUserPlaylists(ctx.user.id);
+    }),
+
+    // Get public playlists
+    public: publicProcedure.query(async () => {
+      return getPublicPlaylists();
+    }),
+
+    // Get playlist by ID
+    getById: publicProcedure.input(z.object({ id: z.number() })).query(async ({ input }) => {
+      return getPlaylistById(input.id);
+    }),
+
+    // Toggle playlist visibility
+    togglePublic: protectedProcedure
+      .input(z.object({ playlistId: z.number() }))
+      .mutation(async ({ ctx, input }) => {
+        const db = await getDb();
+        if (!db) throw new Error("Database not available");
+
+        const playlist = await getPlaylistById(input.playlistId);
+        if (!playlist || playlist.userId !== ctx.user.id) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Not authorized" });
+        }
+
+        await db
+          .update(playlists)
+          .set({ isPublic: playlist.isPublic === 1 ? 0 : 1 })
+          .where(eq(playlists.id, input.playlistId));
+
+        return { success: true, isPublic: playlist.isPublic === 0 };
+      }),
+
+    // Increment play count
+    incrementPlayCount: publicProcedure
+      .input(z.object({ playlistId: z.number() }))
+      .mutation(async ({ input }) => {
+        const db = await getDb();
+        if (!db) return { success: false };
+
+        await db
+          .update(playlists)
+          .set({ playCount: sql`${playlists.playCount} + 1` })
+          .where(eq(playlists.id, input.playlistId));
+
+        return { success: true };
+      }),
+  }),
+
+  // Subscription
+  subscription: router({
+    // Get user's subscription
+    get: protectedProcedure.query(async ({ ctx }) => {
+      return getUserSubscription(ctx.user.id);
+    }),
+
+    // Get monthly playlist count
+    getMonthlyCount: protectedProcedure.query(async ({ ctx }) => {
+      return { count: await getMonthlyPlaylistCount(ctx.user.id) };
+    }),
+  }),
+
+  // Mood templates
+  moodTemplates: router({
+    // Get active mood templates
+    list: publicProcedure.query(async () => {
+      return getActiveMoodTemplates();
+    }),
+  }),
+
+  // Playlist generation
+  generate: router({
+    // Analyze vibe and get parameters
+    analyzeVibe: protectedProcedure
+      .input(z.object({ vibeDescription: z.string() }))
+      .mutation(async ({ input }) => {
+        const analysis = await analyzeVibe(input.vibeDescription);
+        return analysis;
+      }),
+
+    // Analyze user's Spotify history
+    analyzeHistory: protectedProcedure.mutation(async ({ ctx }) => {
+      const token = await getSpotifyToken(ctx.user.id);
+      if (!token?.accessToken) {
+        throw new Error("Spotify not connected");
+      }
+
+      const topTracks = await getUserTopTracks(token.accessToken, 5);
+      const topArtists = await getUserTopArtists(token.accessToken, 5);
+
+      const analysis = await analyzeUserHistory(
+        topTracks.map(t => ({ name: t.name, artists: t.artists.map(a => a.name) })),
+        topArtists.map(a => ({ name: a.name, genres: a.genres }))
+      );
+
+      return analysis;
+    }),
+
+    // Create playlist with AI
+    createPlaylist: protectedProcedure
+      .input(
+        z.object({
+          vibeDescription: z.string(),
+          parameters: z.object({
+            energy: z.number(),
+            valence: z.number(),
+            tempo: z.number(),
+            genres: z.array(z.string()),
+            acousticness: z.number().optional(),
+            danceability: z.number().optional(),
+          }),
+          useHistory: z.boolean().optional(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        // Check subscription limits
+        const subscription = await getUserSubscription(ctx.user.id);
+        const monthlyCount = await getMonthlyPlaylistCount(ctx.user.id);
+
+        if (!subscription || subscription.planType === "free") {
+          if (monthlyCount >= 5) {
+            throw new Error("Free plan limit reached. Upgrade to Pro for unlimited playlists.");
+          }
+        }
+
+        // Get Spotify token
+        let token = await getSpotifyToken(ctx.user.id);
+        if (!token?.accessToken) {
+          throw new Error("Spotify not connected");
+        }
+
+        // Refresh token if expired
+        if (token.expiresAt && new Date(token.expiresAt) < new Date()) {
+          if (!token.refreshToken) {
+            throw new Error("Spotify token expired. Please reconnect.");
+          }
+          const refreshed = await refreshAccessToken(token.refreshToken);
+          await upsertSpotifyToken({
+            userId: ctx.user.id,
+            spotifyId: token.spotifyId,
+            accessToken: refreshed.access_token,
+            refreshToken: refreshed.refresh_token || token.refreshToken,
+            expiresAt: new Date(Date.now() + refreshed.expires_in * 1000),
+          });
+          token = await getSpotifyToken(ctx.user.id);
+        }
+
+        if (!token?.accessToken) {
+          throw new Error("Failed to refresh Spotify token");
+        }
+
+        // Get AI analysis for title and description
+        const analysis = await analyzeVibe(input.vibeDescription);
+
+        // Get recommendations from Spotify
+        let seedTracks: string[] = [];
+        let seedArtists: string[] = [];
+        let seedGenres: string[] = [];
+
+        if (input.useHistory) {
+          const topTracks = await getUserTopTracks(token.accessToken, 2);
+          const topArtists = await getUserTopArtists(token.accessToken, 2);
+          seedTracks = topTracks.map(t => t.id).filter(Boolean);
+          seedArtists = topArtists.map(a => a.id).filter(Boolean);
+        }
+
+        // Calculate how many genre seeds we can add (max 5 total seeds)
+        const usedSeeds = seedTracks.length + seedArtists.length;
+        const availableGenreSlots = Math.max(0, 5 - usedSeeds);
+        
+        // Always include at least some genres if available
+        if (input.parameters.genres && input.parameters.genres.length > 0) {
+          seedGenres = input.parameters.genres.slice(0, Math.max(1, availableGenreSlots));
+        }
+
+        const recommendations = await getRecommendations(token.accessToken, {
+          seedTracks: seedTracks.length > 0 ? seedTracks : undefined,
+          seedArtists: seedArtists.length > 0 ? seedArtists : undefined,
+          seedGenres: seedGenres.length > 0 ? seedGenres : undefined,
+          targetEnergy: input.parameters.energy,
+          targetValence: input.parameters.valence,
+          targetTempo: input.parameters.tempo,
+          targetAcousticness: input.parameters.acousticness,
+          targetDanceability: input.parameters.danceability,
+          limit: 20,
+        });
+
+        if (recommendations.length === 0) {
+          throw new Error("No recommendations found. Try different parameters.");
+        }
+
+        // Create playlist in Spotify
+        if (!token.spotifyId) {
+          throw new Error("Spotify user ID not found");
+        }
+
+        const spotifyPlaylist = await createPlaylist(
+          token.accessToken,
+          token.spotifyId,
+          analysis.playlistTitle,
+          analysis.playlistDescription,
+          false
+        );
+
+        // Add tracks to playlist
+        const trackUris = recommendations.map(t => t.uri);
+        await addTracksToPlaylist(token.accessToken, spotifyPlaylist.id, trackUris);
+
+        // Generate cover image
+        let coverImageUrl: string | undefined;
+        try {
+          coverImageUrl = await generatePlaylistCover(input.vibeDescription, analysis.moodType);
+          
+          // Upload cover to Spotify if generated
+          if (coverImageUrl) {
+            // Download image and convert to base64
+            const imageResponse = await fetch(coverImageUrl);
+            const imageBuffer = await imageResponse.arrayBuffer();
+            const base64Image = Buffer.from(imageBuffer).toString('base64');
+            await uploadPlaylistCover(token.accessToken, spotifyPlaylist.id, base64Image);
+          }
+        } catch (error) {
+          console.error("Failed to generate/upload cover:", error);
+          // Continue without cover
+        }
+
+        // Save to database
+        await createPlaylistRecord({
+          userId: ctx.user.id,
+          spotifyPlaylistId: spotifyPlaylist.id,
+          vibeDescription: input.vibeDescription,
+          moodType: analysis.moodType,
+          parameters: JSON.stringify(input.parameters),
+          coverImageUrl: coverImageUrl || spotifyPlaylist.images[0]?.url,
+          title: analysis.playlistTitle,
+          description: analysis.playlistDescription,
+          isPublic: 0,
+          playCount: 0,
+        });
+
+        // Create free subscription if doesn't exist
+        if (!subscription) {
+          await createSubscription({
+            userId: ctx.user.id,
+            planType: "free",
+            status: "active",
+            startDate: new Date(),
+          });
+        }
+
+        return {
+          success: true,
+          playlist: {
+            id: spotifyPlaylist.id,
+            title: analysis.playlistTitle,
+            description: analysis.playlistDescription,
+            url: spotifyPlaylist.external_urls.spotify,
+            coverImage: coverImageUrl || spotifyPlaylist.images[0]?.url,
+          },
+        };
+      }),
+  }),
+
+  // Admin panel
+  admin: router({
+    // Get admin stats
+    getStats: protectedProcedure.query(async ({ ctx }) => {
+      if (ctx.user.role !== "admin") {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+      }
+
+      const db = await getDb();
+      if (!db) return null;
+
+      const totalUsers = await db.select({ count: sql<number>`count(*)` }).from(users);
+      const totalPlaylists = await db.select({ count: sql<number>`count(*)` }).from(playlists);
+      const activeSubscriptions = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(subscriptions)
+        .where(eq(subscriptions.status, "active"));
+
+      return {
+        totalUsers: totalUsers[0]?.count || 0,
+        totalPlaylists: totalPlaylists[0]?.count || 0,
+        activeSubscriptions: activeSubscriptions[0]?.count || 0,
+      };
+    }),
+
+    // Get all users
+    getUsers: protectedProcedure.query(async ({ ctx }) => {
+      if (ctx.user.role !== "admin") {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+      }
+
+      const db = await getDb();
+      if (!db) return [];
+
+      return db.select().from(users).orderBy(users.createdAt);
+    }),
+
+    // Get all playlists
+    getAllPlaylists: protectedProcedure.query(async ({ ctx }) => {
+      if (ctx.user.role !== "admin") {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+      }
+
+      const db = await getDb();
+      if (!db) return [];
+
+      return db.select().from(playlists).orderBy(playlists.createdAt).limit(100);
+    }),
+  }),
+  
+  stripe: router({
+    createCheckoutSession: protectedProcedure.mutation(async ({ ctx }) => {
+      const response = await fetch(`${ctx.req.headers.origin || 'http://localhost:3000'}/api/stripe/create-checkout-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: ctx.user.id,
+          userEmail: ctx.user.email,
+          userName: ctx.user.name,
+        }),
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to create checkout session');
+      }
+      
+      const data = await response.json();
+      return { url: data.url };
+    }),
+  }),
+};
+
+export type AppRouter = typeof appRouter;
